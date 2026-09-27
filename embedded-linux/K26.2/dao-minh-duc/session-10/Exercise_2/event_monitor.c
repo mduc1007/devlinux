@@ -16,7 +16,7 @@
 
 static volatile sig_atomic_t keep_running = 1;
 
-void sig_handler(int sig) {
+static void sig_handler(int sig) {
     (void)sig;
     keep_running = 0;
 }
@@ -26,23 +26,23 @@ int main(void) {
     signal(SIGINT, sig_handler);
 
     int total_events = 0;
-    int is_active = 1; // Flag bật/tắt trạng thái giám sát
+    int is_active = 1;
     time_t start_time = time(NULL);
 
-    // 1. Khởi tạo FIFO (Named Pipe)
+    /* 1. Initialize FIFO */
     if (mkfifo(FIFO_PATH, 0666) < 0 && errno != EEXIST) {
         perror("[Monitor] mkfifo failed");
         exit(EXIT_FAILURE);
     }
-    // Mở FIFO ở chế độ O_RDWR để tránh EOF liên tục khi không có tiến trình ghi
+    
     int fifo_fd = open(FIFO_PATH, O_RDWR | O_NONBLOCK);
     if (fifo_fd < 0) {
         perror("[Monitor] open FIFO failed");
         exit(EXIT_FAILURE);
     }
 
-    // 2. Khởi tạo Unix Domain Socket Listener
-    unlink(SOCKET_PATH); // Xóa file socket cũ nếu tồn tại
+    /* 2. Initialize Unix Domain Socket Listener */
+    unlink(SOCKET_PATH);
     int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         perror("[Monitor] socket failed");
@@ -70,17 +70,22 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    // 3. Khởi tạo file theo dõi kích thước
+    /* 3. Initialize File Size Tracking */
     int status_fd = open(FILE_PATH, O_RDWR | O_CREAT, 0666);
     off_t last_file_size = 0;
-    if (status_fd >= 0) {
+
+    if (status_fd < 0) {
+        perror("[Monitor] open FILE_PATH failed");
+    } else {
         struct stat st;
         if (fstat(status_fd, &st) == 0) {
             last_file_size = st.st_size;
+        } else {
+            perror("[Monitor] fstat initial failed");
         }
     }
 
-    // 4. Khởi tạo mảng pollfd cho poll()
+    /* 4. Setup pollfd array */
     struct pollfd fds[NUM_POLL_FDS];
     fds[FD_FIFO].fd = fifo_fd;
     fds[FD_FIFO].events = POLLIN;
@@ -100,11 +105,10 @@ int main(void) {
             break;
         }
 
-        // Timeout (2 giây) -> In HEARTBEAT
         if (ret == 0) {
             printf("[HEARTBEAT] Monitor alive, events_seen=%d\n", total_events);
         } else {
-            // Kiểm tra sự kiện trên FIFO
+            /* Handle FIFO Events */
             if (fds[FD_FIFO].revents & POLLIN) {
                 char buf[BUFFER_SIZE];
                 memset(buf, 0, sizeof(buf));
@@ -118,13 +122,18 @@ int main(void) {
                 }
             }
 
-            // Kiểm tra sự kiện trên Unix Control Socket
+            /* Handle Unix Control Socket Events */
             if (fds[FD_SOCKET_LISTENER].revents & POLLIN) {
                 int client_fd = accept(socket_fd, NULL, NULL);
                 if (client_fd >= 0) {
                     char buf[BUFFER_SIZE];
                     memset(buf, 0, sizeof(buf));
-                    ssize_t valread = recv(client_fd, buf, sizeof(buf) - 1, 0);
+                    
+                    ssize_t valread;
+                    do {
+                        valread = recv(client_fd, buf, sizeof(buf) - 1, 0);
+                    } while (valread < 0 && errno == EINTR);
+
                     if (valread > 0) {
                         buf[strcspn(buf, "\r\n")] = 0;
                         char resp[BUFFER_SIZE];
@@ -152,20 +161,19 @@ int main(void) {
             }
         }
 
-        // Kiểm tra biến động kích thước file /tmp/system_status
+        /* Check File Size Changes */
         if (status_fd >= 0 && is_active) {
             struct stat st;
-            if (fstat(status_fd, &st) == 0) {
-                if (st.st_size != last_file_size) {
-                    printf("[FILE_EVENT] %s size changed to %ld bytes\n", FILE_PATH, (long)st.st_size);
-                    last_file_size = st.st_size;
-                    total_events++;
-                }
+            if (fstat(status_fd, &st) < 0) {
+                perror("[Monitor] fstat error");
+            } else if (st.st_size != last_file_size) {
+                printf("[FILE_EVENT] %s size changed to %ld bytes\n", FILE_PATH, (long)st.st_size);
+                last_file_size = st.st_size;
+                total_events++;
             }
         }
     }
 
-    // Dọn dẹp tài nguyên khi kết thúc
     printf("\n[Monitor] Shutdown complete.\n");
     close(fifo_fd);
     close(socket_fd);

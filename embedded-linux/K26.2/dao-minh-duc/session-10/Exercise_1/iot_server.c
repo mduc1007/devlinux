@@ -15,9 +15,127 @@
 
 static volatile sig_atomic_t keep_running = 1;
 
-void sigint_handler(int sig) {
+static void sigint_handler(int sig) {
     (void)sig;
     keep_running = 0;
+}
+
+static void handle_new_connection(int listen_fd, client_t *clients) {
+    struct sockaddr_in client_addr;
+    socklen_t addrlen = sizeof(client_addr);
+    int new_socket = accept(listen_fd, (struct sockaddr *)&client_addr, &addrlen);
+
+    if (new_socket < 0) {
+        if (errno != EINTR && errno != EAGAIN) {
+            perror("[Server] accept failed");
+        }
+        return;
+    }
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd == -1) {
+            clients[i].fd = new_socket;
+            clients[i].mode = 0;
+            clients[i].last_activity = time(NULL);
+            printf("[Server] Client %d connected from %s:%d\n",
+                   i + 1, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            return;
+        }
+    }
+
+    const char *msg = "ERROR: Server full\n";
+    send(new_socket, msg, strlen(msg), 0);
+    close(new_socket);
+}
+
+static void handle_client_data(int idx, client_t *clients, int *current_mode) {
+    int client_fd = clients[idx].fd;
+    char buffer[BUFFER_SIZE];
+    memset(buffer, 0, sizeof(buffer));
+
+    ssize_t valread = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+    if (valread < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+        perror("[Server] recv error");
+        close(client_fd);
+        clients[idx].fd = -1;
+        return;
+    } 
+    
+    if (valread == 0) {
+        printf("[Server] Client %d disconnected\n", idx + 1);
+        close(client_fd);
+        clients[idx].fd = -1;
+        return;
+    }
+
+    buffer[strcspn(buffer, "\r\n")] = 0;
+    if (strlen(buffer) == 0) return;
+
+    clients[idx].last_activity = time(NULL);
+    char response[BUFFER_SIZE];
+    memset(response, 0, sizeof(response));
+
+    if (strcmp(buffer, "GET_TEMP") == 0) {
+        double temp = TEMP_MIN + (rand() % (int)(TEMP_VARIATION * 10)) / 10.0;
+        snprintf(response, sizeof(response), "%.1f\n", temp);
+        printf("[Server] Client %d: GET_TEMP -> %.1f\n", idx + 1, temp);
+    } else if (strcmp(buffer, "GET_HUMIDITY") == 0) {
+        double humidity = HUMI_MIN + (rand() % (int)(HUMI_VARIATION * 10)) / 10.0;
+        snprintf(response, sizeof(response), "%.1f\n", humidity);
+        printf("[Server] Client %d: GET_HUMIDITY -> %.1f\n", idx + 1, humidity);
+    } else if (strncmp(buffer, "SET_MODE ", 9) == 0) {
+        int mode = atoi(buffer + 9);
+        clients[idx].mode = mode;
+        *current_mode = mode;
+        snprintf(response, sizeof(response), "OK\n");
+        printf("[Server] Client %d: SET_MODE %d -> OK\n", idx + 1, mode);
+    } else if (strcmp(buffer, "QUIT") == 0) {
+        snprintf(response, sizeof(response), "BYE\n");
+        send(client_fd, response, strlen(response), 0);
+        printf("[Server] Client %d sent QUIT\n", idx + 1);
+        close(client_fd);
+        clients[idx].fd = -1;
+        return;
+    } else {
+        snprintf(response, sizeof(response), "ERROR: Unknown command\n");
+        printf("[Server] Client %d: Unknown command '%s'\n", idx + 1, buffer);
+    }
+
+    send(client_fd, response, strlen(response), 0);
+}
+
+static void do_broadcast(client_t *clients, int current_mode) {
+    int connected_count = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd > 0) connected_count++;
+    }
+
+    if (connected_count == 0) return;
+
+    double temp = TEMP_MIN + (rand() % (int)(TEMP_VARIATION * 10)) / 10.0;
+    double humidity = HUMI_MIN + (rand() % (int)(HUMI_VARIATION * 10)) / 10.0;
+    char broadcast_msg[BUFFER_SIZE];
+
+    snprintf(broadcast_msg, sizeof(broadcast_msg),
+             "[BROADCAST] Temp=%.1f Humidity=%.1f Mode=%d Clients=%d\n",
+             temp, humidity, current_mode, connected_count);
+
+    printf("[Server] Broadcasting to %d clients: Temp=%.1f Humidity=%.1f Mode=%d Clients=%d\n",
+           connected_count, temp, humidity, current_mode, connected_count);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd > 0) {
+            ssize_t sent = send(clients[i].fd, broadcast_msg, strlen(broadcast_msg), MSG_DONTWAIT);
+            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                close(clients[i].fd);
+                clients[i].fd = -1;
+            }
+        }
+    }
 }
 
 int main(void) {
@@ -65,13 +183,12 @@ int main(void) {
     }
 
     time_t last_broadcast = time(NULL);
-    int current_mode = 1; // Default mode
+    int current_mode = 1;
 
     while (keep_running) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(listen_fd, &readfds);
-
         int max_fd = listen_fd;
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -83,11 +200,7 @@ int main(void) {
             }
         }
 
-        // Timeout 1s để duy trì kiểm tra định kỳ cho broadcast và tín hiệu thoát
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
 
         if (activity < 0 && errno != EINTR) {
@@ -95,123 +208,28 @@ int main(void) {
             break;
         }
 
-        // 1. Kiểm tra kết nối mới trên listen socket
-        if (FD_ISSET(listen_fd, &readfds)) {
-            struct sockaddr_in client_addr;
-            socklen_t addrlen = sizeof(client_addr);
-            int new_socket = accept(listen_fd, (struct sockaddr *)&client_addr, &addrlen);
+        if (activity > 0) {
+            if (FD_ISSET(listen_fd, &readfds)) {
+                handle_new_connection(listen_fd, clients);
+            }
 
-            if (new_socket >= 0) {
-                int added = 0;
-                for (int i = 0; i < MAX_CLIENTS; i++) {
-                    if (clients[i].fd == -1) {
-                        clients[i].fd = new_socket;
-                        clients[i].mode = 0;
-                        clients[i].last_activity = time(NULL);
-                        printf("[Server] Client %d connected from %s:%d\n",
-                               i + 1, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                        added = 1;
-                        break;
-                    }
-                }
-                if (!added) {
-                    const char *msg = "ERROR: Server full\n";
-                    send(new_socket, msg, strlen(msg), 0);
-                    close(new_socket);
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].fd > 0 && FD_ISSET(clients[i].fd, &readfds)) {
+                    handle_client_data(i, clients, &current_mode);
                 }
             }
         }
 
-        // 2. Kiểm tra dữ liệu đến từ các client socket
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            int client_fd = clients[i].fd;
-            if (client_fd > 0 && FD_ISSET(client_fd, &readfds)) {
-                char buffer[BUFFER_SIZE];
-                memset(buffer, 0, sizeof(buffer));
-                int valread = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-
-                if (valread <= 0) {
-                    // Client ngắt kết nối hoặc gặp lỗi
-                    printf("[Server] Client %d disconnected\n", i + 1);
-                    close(client_fd);
-                    clients[i].fd = -1;
-                } else {
-                    // Loại bỏ ký tự xuống dòng ở cuối chuỗi
-                    buffer[strcspn(buffer, "\r\n")] = 0;
-
-                    if (strlen(buffer) == 0) continue;
-
-                    clients[i].last_activity = time(NULL);
-                    char response[BUFFER_SIZE];
-                    memset(response, 0, sizeof(response));
-
-                    if (strcmp(buffer, "GET_TEMP") == 0) {
-                        double temp = 25.0 + (rand() % 100) / 10.0;
-                        snprintf(response, sizeof(response), "%.1f\n", temp);
-                        printf("[Server] Client %d: GET_TEMP -> %.1f\n", i + 1, temp);
-                    } else if (strcmp(buffer, "GET_HUMIDITY") == 0) {
-                        double humidity = 30.0 + (rand() % 300) / 10.0;
-                        snprintf(response, sizeof(response), "%.1f\n", humidity);
-                        printf("[Server] Client %d: GET_HUMIDITY -> %.1f\n", i + 1, humidity);
-                    } else if (strncmp(buffer, "SET_MODE ", 9) == 0) {
-                        int mode = atoi(buffer + 9);
-                        clients[i].mode = mode;
-                        current_mode = mode;
-                        snprintf(response, sizeof(response), "OK\n");
-                        printf("[Server] Client %d: SET_MODE %d -> OK\n", i + 1, mode);
-                    } else if (strcmp(buffer, "QUIT") == 0) {
-                        snprintf(response, sizeof(response), "BYE\n");
-                        send(client_fd, response, strlen(response), 0);
-                        printf("[Server] Client %d sent QUIT\n", i + 1);
-                        close(client_fd);
-                        clients[i].fd = -1;
-                        continue;
-                    } else {
-                        snprintf(response, sizeof(response), "ERROR: Unknown command\n");
-                        printf("[Server] Client %d: Unknown command '%s'\n", i + 1, buffer);
-                    }
-
-                    send(client_fd, response, strlen(response), 0);
-                }
-            }
-        }
-
-        // 3. Xử lý Broadcast thông điệp định kỳ mỗi BROADCAST_INTERVAL giây
         time_t now = time(NULL);
         if (now - last_broadcast >= BROADCAST_INTERVAL) {
             last_broadcast = now;
-            int connected_count = 0;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].fd > 0) connected_count++;
-            }
-
-            if (connected_count > 0) {
-                double temp = 25.0 + (rand() % 100) / 10.0;
-                double humidity = 30.0 + (rand() % 300) / 10.0;
-                char broadcast_msg[BUFFER_SIZE];
-
-                snprintf(broadcast_msg, sizeof(broadcast_msg),
-                         "[BROADCAST] Temp=%.1f Humidity=%.1f Mode=%d Clients=%d\n",
-                         temp, humidity, current_mode, connected_count);
-
-                printf("[Server] Broadcasting to %d clients: Temp=%.1f Humidity=%.1f Mode=%d Clients=%d\n",
-                       connected_count, temp, humidity, current_mode, connected_count);
-
-                for (int i = 0; i < MAX_CLIENTS; i++) {
-                    if (clients[i].fd > 0) {
-                        send(clients[i].fd, broadcast_msg, strlen(broadcast_msg), 0);
-                    }
-                }
-            }
+            do_broadcast(clients, current_mode);
         }
     }
 
-    // Dọn dẹp tài nguyên khi ngắt server (SIGINT)
     printf("\n[Server] Shutting down...\n");
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd > 0) {
-            close(clients[i].fd);
-        }
+        if (clients[i].fd > 0) close(clients[i].fd);
     }
     close(listen_fd);
     printf("[Server] Shutdown complete.\n");

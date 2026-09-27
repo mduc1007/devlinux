@@ -32,7 +32,7 @@ int main(void) {
         return 1;
     }
 
-    printf("Connected to IoT Server on localhost:%d. Type commands (GET_TEMP, GET_HUMIDITY, SET_MODE <n>, QUIT):\n", SERVER_PORT);
+    printf("Connected to IoT Server on localhost:%d.\nCommands: GET_TEMP, GET_HUMIDITY, SET_MODE <n>, QUIT\n", SERVER_PORT);
 
     char send_buf[BUFFER_SIZE];
     char recv_buf[BUFFER_SIZE];
@@ -51,10 +51,9 @@ int main(void) {
             break;
         }
 
-        // Nhận dữ liệu/broadcast từ server
         if (FD_ISSET(sock, &readfds)) {
             memset(recv_buf, 0, sizeof(recv_buf));
-            int valread = recv(sock, recv_buf, sizeof(recv_buf) - 1, 0);
+            ssize_t valread = recv(sock, recv_buf, sizeof(recv_buf) - 1, 0);
             if (valread <= 0) {
                 printf("Server disconnected.\n");
                 break;
@@ -62,7 +61,6 @@ int main(void) {
             printf("%s", recv_buf);
         }
 
-        // Lấy lệnh nhập từ bàn phím
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             if (fgets(send_buf, sizeof(send_buf), stdin) == NULL) {
                 break;
@@ -71,7 +69,7 @@ int main(void) {
             send(sock, send_buf, strlen(send_buf), 0);
 
             send_buf[strcspn(send_buf, "\r\n")] = 0;
-            if (strcmp(send_buf, "quit") == 0 || strcmp(send_buf, "QUIT") == 0) {
+            if (strcasecmp(send_buf, "QUIT") == 0) {
                 break;
             }
         }
